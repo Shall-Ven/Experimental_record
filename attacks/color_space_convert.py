@@ -6,33 +6,38 @@ class RGB2LAB(torch.nn.Module):
         super(RGB2LAB, self).__init__()
 
     def forward(self, img):
-        # 将 RGB 值转换为 0 到 1 之间的浮点数
-        img = img.float() / 255.0
+    #srgb = check_image(srgb)
+        img = torch.permute(img,(1,2,0))
+        srgb_pixels = img.reshape([-1,3])#tf.reshape(srgb, [-1, 3])
 
-        # 将 RGB 图像转换为 XYZ 图像
-        R, G, B = torch.unbind(img, dim=2)
-        X = 0.412453*R + 0.357580*G + 0.180423*B
-        Y = 0.212671*R + 0.715160*G + 0.072169*B
-        Z = 0.019334*R + 0.119193*G + 0.950227*B
-        XYZ = torch.stack((X, Y, Z), dim=2)
+        linear_mask = torch.as_tensor(srgb_pixels <= 0.04045, dtype=torch.float32)
+        exponential_mask = torch.as_tensor(srgb_pixels > 0.04045, dtype=torch.float32)
+        rgb_pixels = (srgb_pixels / 12.92 * linear_mask) + (((srgb_pixels + 0.055) / 1.055) ** 2.4) * exponential_mask
+        rgb_to_xyz = torch.as_tensor([
+            #    X        Y          Z
+            [0.412453, 0.212671, 0.019334], # R
+            [0.357580, 0.715160, 0.119193], # G
+            [0.180423, 0.072169, 0.950227], # B
+        ])
+        xyz_pixels = torch.matmul(rgb_pixels, rgb_to_xyz)
 
-        # 将 XYZ 图像转换为 LAB 图像
-        XYZ_ref = torch.tensor([0.950456, 1.0, 1.088754]).to(img.device)
-        XYZ_normalized = XYZ / XYZ_ref
-        epsilon = 0.008856
-        kappa = 903.3
-        f = lambda t: torch.where(t > epsilon, torch.pow(t, 1/3), (kappa*t + 16)/116)
-        fx, fy, fz = [f(t) for t in torch.unbind(XYZ_normalized, dim=2)]
-        L = 116*fy - 16
-        a = 500*(fx - fy)
-        b = 200*(fy - fz)
-        LAB = torch.stack((L, a, b), dim=2)
+        xyz_normalized_pixels = torch.multiply(xyz_pixels, torch.as_tensor([1/0.950456, 1.0, 1/1.088754]))
 
-        # 将 L、A、B 通道的范围调整到 -1 到 1 之间
-        LAB[..., 0] = LAB[..., 0] / 50.0 - 1.0
-        LAB[..., 1:] = LAB[..., 1:] / 128.0
+        epsilon = 6/29
+        linear_mask = torch.as_tensor(xyz_normalized_pixels <= (epsilon**3), dtype=torch.float32)
+        exponential_mask = torch.as_tensor(xyz_normalized_pixels > (epsilon**3), dtype=torch.float32)
+        fxfyfz_pixels = (xyz_normalized_pixels / (3 * epsilon**2) + 4/29) * linear_mask + (xyz_normalized_pixels ** (1/3)) * exponential_mask
 
-        return LAB
+        # convert to lab
+        fxfyfz_to_lab = torch.as_tensor([
+            #  l       a       b
+            [  0.0,  500.0,    0.0], # fx
+            [116.0, -500.0,  200.0], # fy
+            [  0.0,    0.0, -200.0], # fz
+        ])
+        lab_pixels = torch.matmul(fxfyfz_pixels, fxfyfz_to_lab) + torch.as_tensor([-16.0, 0.0, 0.0])
+
+        return lab_pixels.reshape(img.shape)
 
 
 import torch
@@ -42,40 +47,38 @@ class LAB2RGB(torch.nn.Module):
     def __init__(self):
         super(LAB2RGB, self).__init__()
 
-    def forward(self, img):
-        # 将 L、A、B 通道的范围调整回原始范围
-        L, a, b = torch.unbind(img, dim=2)
-        L = (L + 1.0) * 50.0
-        a = a * 128.0
-        b = b * 128.0
-        LAB = torch.stack((L, a, b), dim=2)
+    def forward(self, lab):
+        lab_pixels = lab.reshape([-1, 3])
+                # convert to fxfyfz
+        lab_to_fxfyfz = torch.as_tensor([
+            #   fx      fy        fz
+            [1/116.0, 1/116.0,  1/116.0], # l
+            [1/500.0,     0.0,      0.0], # a
+            [    0.0,     0.0, -1/200.0], # b
+        ])
+        fxfyfz_pixels = torch.matmul(lab_pixels + torch.as_tensor([16.0, 0.0, 0.0]), lab_to_fxfyfz)
 
-        # 将 LAB 图像转换为 XYZ 图像
-        epsilon = 0.008856
-        kappa = 903.3
-        f_inv = lambda t: torch.where(t > epsilon, torch.pow(t, 3), (116*t - 16)/kappa)
-        L, a, b = torch.unbind(LAB, dim=2)
-        fy = (L + 16) / 116
-        fx = a / 500 + fy
-        fz = fy - b / 200
-        fx, fz = [f_inv(t) for t in (fx, fz)]
-        X = 0.950456*fx + 0.000000*fz + 0.000970*fy
-        Y = 1.000000*fy - 0.000070*fx - 0.000012*fz
-        Z = 1.088754*fz + 0.072098*fy + 0.000000*fx
-        XYZ = torch.stack((X, Y, Z), dim=2)
+        # convert to xyz
+        epsilon = 6/29
+        linear_mask = torch.as_tensor(fxfyfz_pixels <= epsilon, dtype=torch.float32)
+        exponential_mask = torch.as_tensor(fxfyfz_pixels > epsilon, dtype=torch.float32)
+        xyz_pixels = (3 * epsilon**2 * (fxfyfz_pixels - 4/29)) * linear_mask + (fxfyfz_pixels ** 3) * exponential_mask
 
-        # 将 XYZ 图像转换为 RGB 图像
-        M = torch.tensor([
-            [ 3.24048134, -1.53715152, -0.49853633],
-            [-0.96925495,  1.87599001,  0.04155593],
-            [ 0.05564664, -0.20404134,  1.05731107]
-        ]).to(img.device)
-        RGB = torch.matmul(XYZ, M.t())
-        RGB = torch.where(RGB <= 0.0031308, 12.92*RGB, 1.055*torch.pow(RGB, 1/2.4) - 0.055)
-        RGB = torch.clamp(RGB, 0.0, 1.0)
+        # denormalize for D65 white point
+        xyz_pixels = torch.multiply(xyz_pixels, torch.as_tensor([0.950456, 1.0, 1.088754]))
 
-        # 将 RGB 图像转换为 0 到 255 的整数并转换为 PIL 图像
-        RGB = (255.0*RGB).type(torch.uint8)
-        RGB_pil = RGB.permute(2, 0, 1)
+        xyz_to_rgb = torch.as_tensor([
+            #     r           g          b
+            [ 3.2404542, -0.9692660,  0.0556434], # x
+            [-1.5371385,  1.8760108, -0.2040259], # y
+            [-0.4985314,  0.0415560,  1.0572252], # z
+        ])
+        rgb_pixels = torch.matmul(xyz_pixels, xyz_to_rgb)
+        # avoid a slightly negative number messing up the conversion
+        rgb_pixels = torch.clip(rgb_pixels, 0.0, 1.0)
+        linear_mask = torch.as_tensor(rgb_pixels <= 0.0031308,  dtype=torch.float32)
+        exponential_mask = torch.as_tensor(rgb_pixels > 0.0031308, dtype=torch.float32)
+        srgb_pixels = (rgb_pixels * 12.92 * linear_mask) + ((rgb_pixels ** (1/2.4) * 1.055) - 0.055) * exponential_mask
 
-        return RGB_pil
+        return torch.permute(srgb_pixels.view(lab.shape), (2,0,1))
+
